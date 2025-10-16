@@ -1,0 +1,22 @@
+[Unit]
+Description=Kokoro TTS Service
+After=network.target
+
+[Service]
+Type=simple
+User=jonas
+WorkingDirectory=/home/jonas/kokoro-tts
+Environment="PATH=/home/jonas/kokoro-tts/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/jonas/kokoro-tts/venv/bin/python kokoro_tts_service.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kokoro-tts
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
