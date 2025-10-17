@@ -11,10 +11,13 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 from kokoro import KPipeline
+from huggingface_hub import list_repo_files
 
 
 # ============================================================================
@@ -89,38 +92,71 @@ class BatchResponse(BaseModel):
 # Voice Configuration
 # ============================================================================
 
-AVAILABLE_VOICES = [
-    VoiceInfo(
-        id="af_bella",
-        name="Bella",
-        gender="female",
-        accent="american",
-        description="Warm, mature narrator voice"
-    ),
-    VoiceInfo(
-        id="af_sarah",
-        name="Sarah",
-        gender="female",
-        accent="american",
-        description="Sophisticated, elegant"
-    ),
-    VoiceInfo(
-        id="af_nicole",
-        name="Nicole",
-        gender="female",
-        accent="irish",
-        description="Playful, energetic"
-    ),
-    VoiceInfo(
-        id="af_sky",
-        name="Sky",
-        gender="female",
-        accent="american",
-        description="Confident, knowing"
-    ),
-]
+def get_voice_metadata(voice_id: str) -> VoiceInfo:
+    """Generate metadata for a voice based on its ID"""
+    # Parse voice ID: [gender/language][gender]_[name]
+    # af = American Female, am = American Male, bf = British Female, etc.
 
-VOICE_IDS = {v.id for v in AVAILABLE_VOICES}
+    prefix = voice_id.split('_')[0] if '_' in voice_id else voice_id
+    name = voice_id.split('_')[1].capitalize() if '_' in voice_id else voice_id
+
+    # Language/accent mapping
+    accent_map = {
+        'af': ('female', 'american'),
+        'am': ('male', 'american'),
+        'bf': ('female', 'british'),
+        'bm': ('male', 'british'),
+        'ef': ('female', 'european'),
+        'em': ('male', 'european'),
+        'ff': ('female', 'french'),
+        'hf': ('female', 'hindi'),
+        'hm': ('male', 'hindi'),
+        'if': ('female', 'irish'),
+        'im': ('male', 'irish'),
+        'jf': ('female', 'japanese'),
+        'jm': ('male', 'japanese'),
+        'pf': ('female', 'portuguese'),
+        'pm': ('male', 'portuguese'),
+        'zf': ('female', 'chinese'),
+        'zm': ('male', 'chinese'),
+    }
+
+    gender, accent = accent_map.get(prefix, ('unknown', 'unknown'))
+
+    return VoiceInfo(
+        id=voice_id,
+        name=name,
+        gender=gender,
+        accent=accent,
+        description=f"{accent.capitalize()} {gender} voice"
+    )
+
+def load_available_voices() -> tuple[list[VoiceInfo], set[str]]:
+    """Load all available voices from Kokoro HuggingFace repo"""
+    try:
+        print("Loading available voices from Kokoro-82M repository...")
+        repo_files = list_repo_files('hexgrad/Kokoro-82M')
+        voice_files = [f for f in repo_files if f.startswith('voices/') and f.endswith('.pt')]
+        voice_ids = sorted([f.replace('voices/', '').replace('.pt', '') for f in voice_files])
+
+        available_voices = [get_voice_metadata(vid) for vid in voice_ids]
+        voice_id_set = set(voice_ids)
+
+        print(f"Loaded {len(voice_ids)} voices: {', '.join(voice_ids[:10])}{'...' if len(voice_ids) > 10 else ''}")
+        return available_voices, voice_id_set
+    except Exception as e:
+        print(f"Warning: Could not load voices from HuggingFace: {e}")
+        print("Falling back to default voice set")
+        # Fallback to original 4 voices
+        default_voices = [
+            VoiceInfo(id="af_bella", name="Bella", gender="female", accent="american", description="Warm, mature narrator voice"),
+            VoiceInfo(id="af_sarah", name="Sarah", gender="female", accent="american", description="Sophisticated, elegant"),
+            VoiceInfo(id="af_nicole", name="Nicole", gender="female", accent="irish", description="Playful, energetic"),
+            VoiceInfo(id="af_sky", name="Sky", gender="female", accent="american", description="Confident, knowing"),
+        ]
+        return default_voices, {v.id for v in default_voices}
+
+AVAILABLE_VOICES, VOICE_IDS = load_available_voices()
 SAMPLE_RATE = 24000  # Kokoro uses 24kHz
 
 
@@ -190,6 +226,17 @@ app = FastAPI(
     description="Text-to-speech synthesis using Kokoro-82M",
     version="1.0"
 )
+
+# Add validation error handler
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    print(f"ERROR: Validation failed for {request.method} {request.url.path}")
+    print(f"ERROR: Request body: {await request.body()}")
+    print(f"ERROR: Validation errors: {exc.errors()}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors()},
+    )
 
 # Initialize TTS engine at startup
 tts_engine = None
@@ -278,8 +325,19 @@ async def synthesize(request: SynthesizeRequest):
 @app.post("/synthesize/batch", response_model=BatchResponse)
 async def synthesize_batch(request: BatchRequest):
     """Batch synthesize multiple segments"""
+    print(f"Received batch synthesize request with {len(request.segments)} segments, format={request.format}")
+    for i, seg in enumerate(request.segments):
+        print(f"  Segment {i}: id={seg.id}, text='{seg.text[:50]}...', voice={seg.voice}, speed={seg.speed}")
+
     if tts_engine is None:
         raise HTTPException(status_code=503, detail="TTS engine not initialized")
+
+    if len(request.segments) == 0:
+        print("ERROR: Empty segments array - cannot synthesize zero segments")
+        raise HTTPException(
+            status_code=400,
+            detail="segments array is empty - at least one segment is required"
+        )
 
     if request.format == "mp3":
         raise HTTPException(
